@@ -3,11 +3,12 @@
   import Button from 'flowbite-svelte/Button.svelte'
   import {
     acknowledgeReminder, addAnnouncement, addSession, addSpeaker, addTerm, canRedo, canUndo, clearDuplicate,
-    deleteCue, desk, getDelay, ingestCue, moveCue, publishAnnouncement, redoDesk, sendReminder, setActiveCue,
-    setCueStatus, setFontScale, setLiveSimulation, setOnline, speakerName, termTarget, undoDesk, updateCue,
-    updateSession, updateSpeaker, updateTerm
+    confirmHandover, cueShiftLabel, deleteCue, desk, getDelay, ingestCue, initiateHandover, moveCue,
+    pendingHandovers, publishAnnouncement, redoDesk, sendReminder, setActiveCue, setCueStatus, setFontScale,
+    setLiveSimulation, setOnline, speakerName, termTarget, toggleHandoverReminder, cancelHandover, undoDesk,
+    updateCue, updateSession, updateSpeaker, updateTerm, versionShiftLabel
   } from '$lib/store'
-  import type { Announcement, Cue, Session, TabId, Term } from '$lib/types'
+  import type { Announcement, Cue, Handover, Session, TabId, Term } from '$lib/types'
 
   const liveLines = [
     'Cooling corridors can connect parks, schools, and shaded transit stops.',
@@ -26,6 +27,8 @@
   let notice = ''
   let announcementText = ''
   let announcementLevel: Announcement['level'] = 'info'
+  let handoverFrom = ''
+  let handoverTo = ''
   let manualInput: HTMLTextAreaElement
   let simulationIndex = 0
   let showHelp = false
@@ -39,6 +42,9 @@
   $: activeSpeaker = $desk.speakers.find(item => item.id === activeCue?.speakerId)
   $: activeTerms = $desk.terms.filter(item => item.speakerId === activeCue?.speakerId || activeCue?.tags.includes(item.target))
   $: unreadReminders = $desk.reminders.filter(item => !item.acknowledged)
+  $: pendingHandoverList = pendingHandovers($desk)
+  $: handoverHistory = $desk.handovers.filter(item => item.status !== 'pending')
+  $: highOpenCount = pendingHandoverList.reduce((sum, item) => sum + item.reminderItems.filter(row => row.priority === 'high' && !row.handedOff).length, 0)
 
   onMount(() => {
     if (typeof navigator !== 'undefined') setOnline(navigator.onLine)
@@ -105,6 +111,36 @@
     announcementText = ''
     flash('紧急通知已保存到后台。')
   }
+  function startHandover() {
+    const result = initiateHandover(handoverFrom || $desk.shiftLabel, handoverTo)
+    if (result === 'invalid') { flash('请填写接班班次名称。'); return }
+    handoverTo = ''
+    if (result === 'conflict') flash('检测到同一交接已有人提交，两版均已保留并标注归属变化。')
+    else flash('交接已发起：当前队列与未确认提醒已冻结，等待旧班确认转交。')
+  }
+  function completeHandover(handover: Handover) {
+    if (confirmHandover(handover.id)) flash(`交接完成，${handover.toLabel} 起按业务时间接管后续段落。`)
+    else flash('仍有高优先提醒未逐条交清，暂不能确认转交。')
+  }
+  function lateCues(handover: Handover): Cue[] {
+    return $desk.cues.filter(item => !handover.frozenCueIds.includes(item.id))
+  }
+  function frozenCues(handover: Handover): Cue[] {
+    return handover.frozenCueIds.map(id => $desk.cues.find(item => item.id === id)).filter((item): item is Cue => Boolean(item))
+  }
+  function conflictPartner(handover: Handover): Handover | undefined {
+    if (!handover.conflictGroup) return undefined
+    return $desk.handovers.find(item => item.id !== handover.id && item.conflictGroup === handover.conflictGroup)
+  }
+  function attributionDiff(a: Handover, b: Handover): Cue[] {
+    return $desk.cues.filter(item => versionShiftLabel(a, item) !== versionShiftLabel(b, item))
+  }
+  function highOpen(handover: Handover): number {
+    return handover.reminderItems.filter(item => item.priority === 'high' && !item.handedOff).length
+  }
+  function backstageAnnouncements(handover: Handover): Announcement[] {
+    return handover.backstageAnnouncementIds.map(id => $desk.announcements.find(item => item.id === id)).filter((item): item is Announcement => Boolean(item))
+  }
   function formatTime(timestamp: number) {
     return new Date(timestamp).toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false })
   }
@@ -146,11 +182,12 @@
         <div><strong class="block tracking-tight">会议同传提示台</strong><span class="block text-[10px] uppercase tracking-[.16em] text-slate-400">Live Interpreter Cue Desk</span></div>
       </div>
       <nav class="order-3 flex w-full gap-1 overflow-x-auto rounded-xl bg-slate-800/80 p-1 lg:order-none lg:w-auto" aria-label="工作区">
-        {#each [['live','现场传译'],['backstage','后台准备'],['terms','术语与通知'],['offline','离线暂存']] as item}
+        {#each [['live','现场传译'],['backstage','后台准备'],['terms','术语与通知'],['offline','离线暂存'],['handover','换班移交']] as item}
           <button class="focus-ring whitespace-nowrap rounded-lg px-4 py-2 text-xs font-bold transition {tab === item[0] ? 'bg-white text-ink shadow' : 'text-slate-300 hover:bg-slate-700'}" aria-current={tab === item[0] ? 'page' : undefined} on:click={() => tab = item[0] as TabId}>
             {item[1]}
             {#if item[0] === 'live' && pendingCount}<span class="ml-2 rounded-full bg-orange-500 px-1.5 py-0.5 text-[10px] text-white">{pendingCount}</span>{/if}
             {#if item[0] === 'offline' && offlineCount}<span class="ml-2 rounded-full bg-amber-500 px-1.5 py-0.5 text-[10px] text-white">{offlineCount}</span>{/if}
+            {#if item[0] === 'handover' && pendingHandoverList.length}<span class="ml-2 rounded-full bg-red-500 px-1.5 py-0.5 text-[10px] text-white">{pendingHandoverList.length}</span>{/if}
           </button>
         {/each}
       </nav>
@@ -183,6 +220,16 @@
           <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl text-amber-700">{lateCount}</strong><span class="text-[10px] text-slate-500">偏高延迟</span></div>
           <div class="rounded-xl border bg-white px-4 py-2"><strong class="block text-xl text-red-700">{duplicateCount}</strong><span class="text-[10px] text-slate-500">疑似重复</span></div>
         </div>
+      </div>
+
+      <div class="mb-4 flex flex-wrap items-center gap-2 text-xs">
+        <span class="rounded-full bg-slate-900 px-3 py-1.5 font-bold text-white">当前班次 · {$desk.shiftLabel}</span>
+        {#each pendingHandoverList as handover}
+          <button class="focus-ring flex items-center gap-2 rounded-full border border-amber-300 bg-amber-50 px-3 py-1.5 font-bold text-amber-900" on:click={() => tab = 'handover'}>
+            换班待确认：{handover.fromLabel} → {handover.toLabel}，期间到达与补录内容仍归 {handover.fromLabel}
+            {#if highOpen(handover)}<span class="rounded-full bg-red-600 px-1.5 py-0.5 text-[10px] text-white">{highOpen(handover)} 条高优先待交清</span>{/if}
+          </button>
+        {/each}
       </div>
 
       <div class="grid gap-4 xl:grid-cols-[minmax(0,1.65fr)_minmax(300px,.75fr)]">
@@ -224,6 +271,7 @@
                         <span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">{speakerName($desk, cue.speakerId)}</span>
                         <span class="rounded-md border px-2 py-1 {delayClass(getDelay(cue, now))}">{formatTime(cue.receivedAt)} · 延迟 {getDelay(cue, now)}s</span>
                         <span class="rounded-md px-2 py-1 {cue.status === 'confirmed' ? 'bg-emerald-100 text-emerald-800' : cue.status === 'followup' ? 'bg-amber-100 text-amber-900' : 'bg-blue-100 text-blue-800'}">{statusLabel(cue.status)}</span>
+                        <span class="rounded-md px-2 py-1 {cueShiftLabel($desk, cue) === $desk.shiftLabel ? 'bg-teal-100 text-teal-800' : 'bg-slate-100 text-slate-500'}">归·{cueShiftLabel($desk, cue)}</span>
                         {#if cue.offline}<span class="rounded-md bg-amber-100 px-2 py-1 text-amber-900">离线暂存</span>{/if}
                         {#if cue.manual}<span class="rounded-md bg-slate-100 px-2 py-1 text-slate-600">手工</span>{/if}
                       </div>
@@ -373,6 +421,142 @@
         </section>
       </div>
     {/if}
+    {#if tab === 'handover'}
+      <div class="mb-5"><p class="text-[10px] font-black uppercase tracking-[.18em] text-teal-700">冻结队列 · 逐条交清 · 旧班确认后生效</p><h1 class="mt-1 text-3xl font-black">换班移交</h1></div>
+      <div class="grid gap-4 xl:grid-cols-[.8fr_1.2fr]">
+        <div class="space-y-4">
+          <section class="rounded-2xl border bg-white p-5 shadow-sm">
+            <div class="mb-4"><h2 class="font-black">发起交接</h2><p class="text-xs text-slate-500">确认交接即冻结当前可见队列与未确认提醒，按业务时间归属。</p></div>
+            <label class="block text-xs font-bold">交班（旧班）<input class="focus-ring mt-2 w-full rounded-xl border p-3 text-sm" bind:value={handoverFrom} placeholder={`当前班次：${$desk.shiftLabel}`} /></label>
+            <label class="mt-4 block text-xs font-bold">接班（新班）<input class="focus-ring mt-2 w-full rounded-xl border p-3 text-sm" bind:value={handoverTo} placeholder="例如：第二班 · 译员王" /></label>
+            <Button class="mt-4 w-full" size="lg" disabled={!handoverTo.trim()} on:click={startHandover}>确认交接并冻结当前队列</Button>
+            <div class="mt-4 space-y-2 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+              <p><strong>归属规则：</strong>冻结后到达或离线补录的段落仍归旧班，旧班确认转交后才进入新班。</p>
+              <p><strong>提醒交清：</strong>未读高优先提醒须逐条勾选交清，否则不能确认转交。</p>
+              <p><strong>发布闸门：</strong>后台未发布通知不随交接出现在现场，仍需管理员手动发布。</p>
+              <p><strong>重复提交：</strong>两人同时提交同一交接时两版都保留，并逐条指出归属变化。</p>
+            </div>
+          </section>
+          {#if handoverHistory.length}
+            <section class="rounded-2xl border bg-white p-5 shadow-sm">
+              <h2 class="mb-3 font-black">交接历史</h2>
+              <div class="space-y-3">
+                {#each handoverHistory as handover}
+                  <article class="rounded-xl border p-3 {handover.status === 'confirmed' ? 'border-emerald-200 bg-emerald-50/50' : 'border-slate-200 bg-slate-50'}">
+                    <div class="flex flex-wrap items-center justify-between gap-2">
+                      <strong class="text-sm">{handover.fromLabel} → {handover.toLabel}</strong>
+                      <span class="rounded-full px-2 py-1 text-[10px] font-black {handover.status === 'confirmed' ? 'bg-emerald-600 text-white' : 'bg-slate-300 text-slate-700'}">{handover.status === 'confirmed' ? '已生效' : '未采用 · 保留备查'}</span>
+                    </div>
+                    <p class="mt-1 text-[11px] text-slate-500">冻结于 {formatTime(handover.cutoff)} · 队列 {handover.frozenCueIds.length} 条 · 提醒 {handover.reminderItems.length} 条{#if handover.confirmedAt} · 确认于 {formatTime(handover.confirmedAt)}{/if}</p>
+                    {#if conflictPartner(handover)}
+                      {@const partner = conflictPartner(handover)}
+                      {#if partner}
+                        <div class="mt-2 rounded-lg border border-amber-200 bg-amber-50 p-2 text-[11px] text-amber-900">
+                          <strong>双版本归属变化（对比 {formatTime(partner.cutoff)} 版本）：</strong>
+                          {#each attributionDiff(handover, partner) as cue}
+                            <p class="mt-1">“{cue.text.slice(0, 40)}…” 本版归 {versionShiftLabel(handover, cue)} · 另一版归 {versionShiftLabel(partner, cue)}</p>
+                          {/each}
+                          {#if !attributionDiff(handover, partner).length}<p class="mt-1">两版冻结点之间无归属变化。</p>{/if}
+                        </div>
+                      {/if}
+                    {/if}
+                  </article>
+                {/each}
+              </div>
+            </section>
+          {/if}
+        </div>
+
+        <div class="space-y-4">
+          {#each pendingHandoverList as handover}
+            {@const partner = conflictPartner(handover)}
+            <section class="overflow-hidden rounded-2xl border border-amber-300 bg-white shadow-sm">
+              <div class="flex flex-wrap items-center justify-between gap-2 border-b border-amber-200 bg-amber-50 px-4 py-3">
+                <div><span class="text-[10px] font-black uppercase tracking-[.16em] text-amber-700">待旧班确认转交</span><h2 class="mt-1 font-black">{handover.fromLabel} → {handover.toLabel}</h2></div>
+                <div class="flex items-center gap-2">
+                  {#if partner}<span class="rounded-full bg-red-600 px-2.5 py-1 text-[10px] font-black text-white">冲突 · 双版本并存</span>{/if}
+                  <span class="rounded-full bg-white px-2.5 py-1 text-[10px] font-bold text-amber-800">冻结于 {formatTime(handover.cutoff)}</span>
+                </div>
+              </div>
+              <div class="space-y-4 p-4">
+                {#if partner}
+                  <div class="rounded-xl border border-red-200 bg-red-50 p-3 text-xs text-red-900">
+                    <strong>两人同时提交了同一交接，两版均保留。</strong>本版冻结于 {formatTime(handover.cutoff)}，另一版冻结于 {formatTime(partner.cutoff)}；确认其中一版后另一版自动标记为“未采用”并保留备查。
+                    {#if attributionDiff(handover, partner).length}
+                      <div class="mt-2 space-y-1">
+                        {#each attributionDiff(handover, partner) as cue}
+                          <p class="rounded-lg bg-white/70 px-2 py-1">“{cue.text.slice(0, 40)}…” 本版归 <strong>{versionShiftLabel(handover, cue)}</strong> · 另一版归 <strong>{versionShiftLabel(partner, cue)}</strong></p>
+                        {/each}
+                      </div>
+                    {:else}
+                      <p class="mt-2">两版冻结点之间没有段落归属变化。</p>
+                    {/if}
+                  </div>
+                {/if}
+
+                <div>
+                  <h3 class="mb-2 text-xs font-black uppercase tracking-wider text-slate-500">冻结队列 · {frozenCues(handover).length} 条（按业务时间归 {handover.fromLabel}）</h3>
+                  <div class="max-h-44 space-y-1 overflow-y-auto scrollbar-thin">
+                    {#each frozenCues(handover) as cue}
+                      <p class="rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-700"><span class="mr-2 font-bold text-slate-400">{formatTime(cue.receivedAt)}</span>{cue.text}</p>
+                    {/each}
+                    {#if !frozenCues(handover).length}<p class="text-xs text-slate-400">冻结时队列为空。</p>{/if}
+                  </div>
+                </div>
+
+                <div>
+                  <h3 class="mb-2 text-xs font-black uppercase tracking-wider text-slate-500">冻结后到达 / 离线补录 · {lateCues(handover).length} 条（仍归 {handover.fromLabel}，确认后转入 {handover.toLabel}）</h3>
+                  <div class="max-h-44 space-y-1 overflow-y-auto scrollbar-thin">
+                    {#each lateCues(handover) as cue}
+                      <div class="flex items-center justify-between gap-2 rounded-lg border border-dashed border-amber-300 bg-amber-50/60 px-3 py-2 text-xs">
+                        <span class="min-w-0 flex-1 truncate">{cue.text}</span>
+                        <span class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold {cue.receivedAt <= handover.cutoff ? 'bg-slate-200 text-slate-700' : 'bg-amber-200 text-amber-900'}">{cue.receivedAt <= handover.cutoff ? '补录 · 业务时间归旧班' : '晚到 · 确认后归新班'}</span>
+                      </div>
+                    {/each}
+                    {#if !lateCues(handover).length}<p class="text-xs text-slate-400">冻结后暂无新到或补录段落。</p>{/if}
+                  </div>
+                </div>
+
+                <div>
+                  <h3 class="mb-2 text-xs font-black uppercase tracking-wider text-slate-500">未确认提醒逐条交清 · 高优先 {highOpen(handover)} 条未交</h3>
+                  <div class="space-y-1">
+                    {#each handover.reminderItems as item}
+                      <label class="flex cursor-pointer items-center gap-3 rounded-lg border px-3 py-2 text-xs {item.priority === 'high' && !item.handedOff ? 'border-red-300 bg-red-50' : item.handedOff ? 'border-emerald-200 bg-emerald-50/60' : 'border-slate-200 bg-slate-50'}">
+                        <input type="checkbox" class="h-4 w-4 accent-teal-700" checked={item.handedOff} on:change={() => toggleHandoverReminder(handover.id, item.reminderId)} />
+                        <span class="flex-1 {item.handedOff ? 'text-slate-400 line-through' : ''}"><strong>{item.target}</strong></span>
+                        {#if item.priority === 'high'}<span class="rounded-full bg-red-600 px-2 py-0.5 text-[10px] font-black text-white">高优先</span>{/if}
+                        <span class="text-[10px] font-bold {item.handedOff ? 'text-emerald-700' : 'text-slate-500'}">{item.handedOff ? '已交清' : '待交清'}</span>
+                      </label>
+                    {/each}
+                    {#if !handover.reminderItems.length}<p class="text-xs text-slate-400">冻结时没有未确认提醒。</p>{/if}
+                  </div>
+                </div>
+
+                <div>
+                  <h3 class="mb-2 text-xs font-black uppercase tracking-wider text-slate-500">后台未发布通知 · 不随交接出现在现场</h3>
+                  <div class="space-y-1">
+                    {#each backstageAnnouncements(handover) as announcement}
+                      <p class="flex items-center justify-between gap-2 rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600"><span class="min-w-0 flex-1 truncate">{announcement.text}</span><span class="shrink-0 rounded-full px-2 py-0.5 text-[10px] font-bold {announcement.visibleOnStage ? 'bg-orange-100 text-orange-800' : 'bg-slate-200 text-slate-600'}">{announcement.visibleOnStage ? '已由管理员发布' : '仅后台 · 现场不可见'}</span></p>
+                    {/each}
+                    {#if !backstageAnnouncements(handover).length}<p class="text-xs text-slate-400">冻结时没有未发布的后台通知。</p>{/if}
+                  </div>
+                </div>
+
+                <div class="flex flex-wrap items-center gap-2 border-t pt-3">
+                  <Button color="green" disabled={highOpen(handover) > 0} on:click={() => completeHandover(handover)}>旧班确认转交</Button>
+                  <Button color="light" on:click={() => cancelHandover(handover.id)}>取消本次交接</Button>
+                  {#if highOpen(handover) > 0}<span class="text-xs font-bold text-red-700">还有 {highOpen(handover)} 条高优先提醒未逐条交清</span>{/if}
+                </div>
+              </div>
+            </section>
+          {/each}
+          {#if !pendingHandoverList.length}
+            <section class="grid min-h-60 place-items-center rounded-2xl border bg-white text-center shadow-sm"><div><div class="mx-auto grid h-14 w-14 place-items-center rounded-full bg-teal-100 text-2xl text-teal-700">⇄</div><strong class="mt-3 block text-sm">当前没有待确认的交接</strong><p class="mt-1 text-xs text-slate-500">在左侧填写接班班次并确认交接，即可冻结当前队列发起移交。</p></div></section>
+          {/if}
+        </div>
+      </div>
+    {/if}
+
   </main>
 
   <footer class="mx-auto flex max-w-[1800px] flex-wrap items-center justify-between gap-3 px-4 pb-6 text-[11px] text-slate-500 lg:px-6"><span>本机自动保存 · 最近更新 {new Date($desk.updatedAt).toLocaleTimeString('zh-CN', { hour12: false })}</span><span>后台准备内容与现场可见内容严格分离</span><div class="flex gap-2"><button class="font-bold underline disabled:opacity-40" disabled={!canUndo()} on:click={undoDesk}>撤销</button><button class="font-bold underline disabled:opacity-40" disabled={!canRedo()} on:click={redoDesk}>重做</button></div></footer>

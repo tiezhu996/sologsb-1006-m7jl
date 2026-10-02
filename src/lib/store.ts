@@ -1,5 +1,5 @@
 import { writable, get } from 'svelte/store'
-import type { Announcement, Cue, CueStatus, DeskState, Reminder, Session, Speaker, Term } from './types'
+import type { Announcement, Cue, CueStatus, DeskState, Handover, Reminder, Session, Speaker, Term } from './types'
 
 const STORAGE_KEY = 'conference-cue-desk-v1'
 const speakers: Speaker[] = [
@@ -33,6 +33,7 @@ function initialCues(): Cue[] {
 function demoState(): DeskState {
   return {
     speakers, sessions, terms, cues: initialCues(), reminders: [], activeCueId: 'cue-103', fontScale: 100,
+    handovers: [], shiftLabel: '第一班',
     announcements: [
       { id: 'ann-1', level: 'info', text: '十点整有消防联动测试，请提醒会场人员保持镇定。', visibleOnStage: false, createdAt: new Date().toISOString() },
       { id: 'ann-2', level: 'urgent', text: '请下一位发言人提前到侧台候场。', visibleOnStage: false, createdAt: new Date().toISOString() }
@@ -145,10 +146,82 @@ export function sendReminder(termId: string, cueId: string) {
   commit(state => {
     const exists = state.reminders.some(item => item.termId === termId && item.cueId === cueId)
     if (exists) return
-    state.reminders.unshift({ id: `rem-${Date.now()}`, termId, cueId, target: state.terms.find(item => item.id === termId)?.target || '', createdAt: Date.now(), acknowledged: false })
+    state.reminders.unshift({ id: `rem-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`, termId, cueId, target: state.terms.find(item => item.id === termId)?.target || '', createdAt: Date.now(), acknowledged: false })
   })
 }
 export function acknowledgeReminder(id: string) { commit(state => { const item = state.reminders.find(row => row.id === id); if (item) item.acknowledged = true }) }
+
+export function initiateHandover(fromLabel: string, toLabel: string): 'ok' | 'conflict' | 'invalid' {
+  const to = toLabel.trim()
+  if (!to) return 'invalid'
+  let result: 'ok' | 'conflict' = 'ok'
+  commit(state => {
+    const from = fromLabel.trim() || state.shiftLabel
+    const cutoff = Date.now()
+    const handover: Handover = {
+      id: `ho-${cutoff}-${Math.random().toString(36).slice(2, 6)}`,
+      fromLabel: from, toLabel: to, createdAt: cutoff, cutoff,
+      frozenCueIds: state.cues.map(item => item.id),
+      reminderItems: state.reminders.filter(item => !item.acknowledged).map(item => ({
+        reminderId: item.id, target: item.target, handedOff: false,
+        priority: state.terms.find(term => term.id === item.termId)?.priority || 'normal'
+      })),
+      backstageAnnouncementIds: state.announcements.filter(item => !item.visibleOnStage).map(item => item.id),
+      status: 'pending', confirmedAt: null, conflictGroup: null
+    }
+    const sibling = state.handovers.find(item => item.status === 'pending' && item.fromLabel === from && item.toLabel === to)
+    if (sibling) {
+      const group = sibling.conflictGroup || sibling.id
+      sibling.conflictGroup = group
+      handover.conflictGroup = group
+      result = 'conflict'
+    }
+    state.handovers.unshift(handover)
+  })
+  return result
+}
+export function toggleHandoverReminder(handoverId: string, reminderId: string) {
+  commit(state => {
+    const item = state.handovers.find(row => row.id === handoverId)?.reminderItems.find(row => row.reminderId === reminderId)
+    if (item) item.handedOff = !item.handedOff
+  })
+}
+export function confirmHandover(handoverId: string): boolean {
+  const target = get(desk).handovers.find(item => item.id === handoverId)
+  if (!target || target.status !== 'pending') return false
+  if (target.reminderItems.some(item => item.priority === 'high' && !item.handedOff)) return false
+  commit(state => {
+    const handover = state.handovers.find(item => item.id === handoverId)
+    if (!handover) return
+    handover.status = 'confirmed'
+    handover.confirmedAt = Date.now()
+    state.shiftLabel = handover.toLabel
+    state.handovers.forEach(other => {
+      if (other.id !== handoverId && other.status === 'pending' && other.conflictGroup && other.conflictGroup === handover.conflictGroup) other.status = 'superseded'
+    })
+  })
+  return true
+}
+export function cancelHandover(handoverId: string) {
+  commit(state => { const item = state.handovers.find(row => row.id === handoverId); if (item && item.status === 'pending') item.status = 'superseded' })
+}
+
+export function pendingHandovers(state: DeskState): Handover[] { return state.handovers.filter(item => item.status === 'pending') }
+export function lastConfirmedHandover(state: DeskState): Handover | undefined {
+  return state.handovers.filter(item => item.status === 'confirmed').sort((a, b) => b.cutoff - a.cutoff)[0]
+}
+/** 交接确认前，晚到与离线补录一律仍归旧班；确认后按业务时间（receivedAt 对 cutoff）归属 */
+export function cueShiftLabel(state: DeskState, cue: Cue): string {
+  const pending = pendingHandovers(state)[0]
+  if (pending) return pending.fromLabel
+  const confirmed = lastConfirmedHandover(state)
+  if (confirmed) return cue.receivedAt <= confirmed.cutoff ? confirmed.fromLabel : confirmed.toLabel
+  return state.shiftLabel
+}
+/** 某个交接版本若生效时，段落的归属（用于对比两版的归属变化） */
+export function versionShiftLabel(handover: Handover, cue: Cue): string {
+  return cue.receivedAt <= handover.cutoff ? handover.fromLabel : handover.toLabel
+}
 
 export function getDelay(cue: Cue, now = Date.now()): number { return Math.max(cue.delaySeconds, Math.round((now - cue.receivedAt) / 1000)) }
 export function speakerName(state: DeskState, id: string): string { return state.speakers.find(item => item.id === id)?.name || '未指定' }
